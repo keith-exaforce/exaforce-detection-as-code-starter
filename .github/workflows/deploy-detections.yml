@@ -1,0 +1,200 @@
+name: Detections CI/CD
+
+# Detection-as-Code pipeline for Exaforce Threat Rules.
+# Every job runs once per tenant listed in the EXF_TENANTS repository variable
+# (space-separated, default "prod").
+#
+# Pull request -> validate every changed rule against EACH tenant (no writes).
+#                 This check gates the merge.
+# Push to main -> deploy (idempotent sync) every changed rule to EACH tenant.
+# Manual run   -> deploy all rules to EACH tenant (workflow_dispatch, main only).
+#
+# Setup (one time): Settings > Environments, one environment per tenant, named
+# exactly as in EXF_TENANTS (default: a single environment called "prod"). In each:
+#     Secret:   EXF_API_TOKEN = <that tenant's Exaforce API token>
+#     Variable: EXF_BASE_URL  = https://<your-tenant>.us.app.exaforce.io
+#     Variable: EXF_PROJECT   = default
+#
+# To add a tenant: create its environment, then set the repository variable
+# EXF_TENANTS to the full list, e.g. "prod staging". No workflow edits needed.
+#
+# Per-rule targeting: a rule YAML may set `tenants: [prod]` (or a list of
+# several); a folder can set a default in _tenants.yml. Omitted or `all` = every
+# tenant. scripts/rule_targets.py decides;
+# a rule naming an unknown tenant fails the build so typos can't hide.
+
+on:
+  pull_request:
+    paths: ["rules/**.yaml", "rules/**/_tenants.yml"]
+  push:
+    branches: [main]
+    paths: ["rules/**.yaml", "rules/**/_tenants.yml"]
+  workflow_dispatch:
+    inputs:
+      all_rules:
+        description: "Deploy ALL rules (not just changed)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  # Space-separated tenant (= GitHub Environment) names. Set the EXF_TENANTS
+  # repository variable to change it.
+  KNOWN_TENANTS: ${{ vars.EXF_TENANTS || 'prod' }}
+
+jobs:
+  # ---------------------------------------------------------------- tenants
+  tenants:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.t.outputs.list }}
+    steps:
+      - id: t
+        run: |
+          list=$(printf '%s\n' $KNOWN_TENANTS | jq -R . | jq -sc .)
+          echo "Tenants: $list"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- validate
+  validate:
+    # Runs on PRs. This is the required status check (one per tenant).
+    needs: tenants
+    if: github.event_name == 'pull_request'
+    name: validate (${{ matrix.tenant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tenant: ${{ fromJSON(needs.tenants.outputs.list) }}
+    environment: ${{ matrix.tenant }}
+    env:
+      EXF_BASE_URL: ${{ vars.EXF_BASE_URL }}
+      EXF_PROJECT: ${{ vars.EXF_PROJECT || 'default' }}
+      EXF_API_TOKEN: ${{ secrets.EXF_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+
+      - name: Duplicate check
+        run: python3 scripts/check_duplicates.py rules
+
+      - name: Check tenant config
+        run: |
+          [ -n "$EXF_BASE_URL" ]  || { echo "::error::EXF_BASE_URL not set on environment '${{ matrix.tenant }}'"; exit 1; }
+          [ -n "$EXF_API_TOKEN" ] || { echo "::error::EXF_API_TOKEN not set on environment '${{ matrix.tenant }}'"; exit 1; }
+
+      - name: Determine changed rules
+        id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          files=$(git diff --name-only "$base" HEAD -- 'rules/*.yaml' || true)
+          # a changed _tenants.yml re-targets every rule in its folder
+          for d in $(git diff --name-only "$base" HEAD -- 'rules/*_tenants.yml' | xargs -r -n1 dirname); do
+            files="$files"$'\n'"$(find "$d" -name '*.yaml' | sort)"
+          done
+          files=$(echo "$files" | sed '/^$/d' | sort -u)
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"; echo "$files" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Validate changed rules
+        run: |
+          set -o pipefail
+          files="${{ steps.changed.outputs.files }}"
+          [ -z "$files" ] && { echo "No rule changes."; echo "No rule changes." >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          echo "## Rule validation: ${{ matrix.tenant }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tenant: \`$EXF_BASE_URL\` project \`$EXF_PROJECT\`" >> "$GITHUB_STEP_SUMMARY"
+          rc=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] || { echo "- skipped (deleted) \`$f\`" >> "$GITHUB_STEP_SUMMARY"; continue; }
+            t=0; python3 scripts/rule_targets.py "$f" "${{ matrix.tenant }}" "$KNOWN_TENANTS" || t=$?
+            if [ "$t" -eq 3 ]; then echo "- skipped (not targeted) \`$f\`" >> "$GITHUB_STEP_SUMMARY"; continue; fi
+            if [ "$t" -ne 0 ]; then echo "- FAIL (bad tenants field) \`$f\`" >> "$GITHUB_STEP_SUMMARY"; rc=1; continue; fi
+            echo "::group::validate $f"
+            if python3 push_detections.py --validate-only "$f"; then
+              echo "- OK \`$f\`" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- FAIL \`$f\`" >> "$GITHUB_STEP_SUMMARY"; rc=1
+            fi
+            echo "::endgroup::"
+          done <<< "$files"
+          exit $rc
+
+  # ------------------------------------------------------------------ deploy
+  deploy:
+    # Runs on merge to main and on manual dispatch, from main only.
+    needs: tenants
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    name: deploy (${{ matrix.tenant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # one tenant failing must not block the others
+      matrix:
+        tenant: ${{ fromJSON(needs.tenants.outputs.list) }}
+    environment: ${{ matrix.tenant }}
+    concurrency:
+      group: deploy-${{ matrix.tenant }}
+      cancel-in-progress: false
+    env:
+      EXF_BASE_URL: ${{ vars.EXF_BASE_URL }}
+      EXF_PROJECT: ${{ vars.EXF_PROJECT || 'default' }}
+      EXF_API_TOKEN: ${{ secrets.EXF_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+
+      - name: Duplicate check
+        run: python3 scripts/check_duplicates.py rules
+
+      - name: Check tenant config
+        run: |
+          [ -n "$EXF_BASE_URL" ]  || { echo "::error::EXF_BASE_URL not set on environment '${{ matrix.tenant }}'"; exit 1; }
+          [ -n "$EXF_API_TOKEN" ] || { echo "::error::EXF_API_TOKEN not set on environment '${{ matrix.tenant }}'"; exit 1; }
+
+      - name: Determine rules to deploy
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            files=$(find rules -name '*.yaml' | sort)
+          else
+            files=$(git diff --name-only '${{ github.event.before }}' '${{ github.sha }}' -- 'rules/*.yaml' || true)
+            # a changed _tenants.yml re-targets every rule in its folder
+            for d in $(git diff --name-only '${{ github.event.before }}' '${{ github.sha }}' -- 'rules/*_tenants.yml' | xargs -r -n1 dirname); do
+              files="$files"$'\n'"$(find "$d" -name '*.yaml' | sort)"
+            done
+            files=$(echo "$files" | sed '/^$/d' | sort -u)
+            [ -z "$files" ] && files=$(find rules -name '*.yaml' | sort)
+          fi
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"; echo "$files" >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy (sync) rules
+        run: |
+          echo "## Rule deployment: ${{ matrix.tenant }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tenant: \`$EXF_BASE_URL\` project \`$EXF_PROJECT\`" >> "$GITHUB_STEP_SUMMARY"
+          rc=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] || { echo "- skipped (deleted) \`$f\`" >> "$GITHUB_STEP_SUMMARY"; continue; }
+            t=0; python3 scripts/rule_targets.py "$f" "${{ matrix.tenant }}" "$KNOWN_TENANTS" || t=$?
+            if [ "$t" -eq 3 ]; then echo "- skipped (not targeted) \`$f\`" >> "$GITHUB_STEP_SUMMARY"; continue; fi
+            if [ "$t" -ne 0 ]; then echo "- FAIL (bad tenants field) \`$f\`" >> "$GITHUB_STEP_SUMMARY"; rc=1; continue; fi
+            echo "::group::sync $f"
+            if python3 push_detections.py --sync --strict "$f"; then
+              echo "- OK \`$f\`" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- FAIL \`$f\`" >> "$GITHUB_STEP_SUMMARY"; rc=1
+            fi
+            echo "::endgroup::"
+          done <<< "${{ steps.pick.outputs.files }}"
+          exit $rc

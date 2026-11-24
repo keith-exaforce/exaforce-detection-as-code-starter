@@ -1,0 +1,5 @@
+# rule_id patterns the drift-sync workflow never imports into Git (shell-style globs).
+# One per line, e.g.
+#   test-*
+#   scratch-rule-*
+# Use it for throwaway rules people create in the UI that you don't want in Git.

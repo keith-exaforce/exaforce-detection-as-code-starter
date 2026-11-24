@@ -1,0 +1,69 @@
+# Sample Exaforce Threat Rule: your first detection-as-code test.
+#
+# Works on any tenant: it uses the generic `Event` entity, so it matches
+# authentication events from every identity source you ingest (Okta, Entra ID,
+# Google Workspace, AWS console, ...).
+#
+# It ships DISABLED, so deploying it creates the rule but never fires it.
+# To see the full loop: open a PR that changes `severity` or `rule_name`, watch
+# the validate check pass, merge, then find the rule under
+# Exabot Detect > Rules > Threat Rules > Custom.
+
+# --- Identity: rule_id is how Git and the platform match this rule. Never reuse one.
+package_id: com.example.detections.samples
+package_name: Sample Detections
+rule_id: sample-failed-signin-from-kp
+rule_name: "[Sample] Failed sign-in from North Korea"
+
+description: >-
+  Sample rule from the Exaforce detection-as-code starter repo. Flags failed
+  authentication attempts whose source IP geolocates to North Korea (KP).
+  Safe to delete once you have written your own rules.
+
+# --- Which tenants get it (optional). Omit or `all` = every tenant in EXF_TENANTS.
+# tenants: [prod]
+
+finding_sources:
+  - Exaforce
+
+# rule_version is set automatically from Git history. Don't add it.
+
+# enabled | disabled
+status: disabled
+
+# --- What happens when the rule matches
+rule_action:
+  action_type: create_detection
+  threat_finding_request:
+    severity: LOW            # LOW | MED | HIGH | CRITICAL
+    entity_type: SESSION
+    title: auto
+    description: auto
+    deduplication_period: 1440       # minutes
+    predict_window_period: 60
+    rule_evaluation_frequency: 15    # minutes
+    mitre_tactic: auto
+    mitre_technique: auto
+    threat_category: auto
+    threat_classification: auto
+    threat_signals:
+      - [com.exaforce.threats, OPERATION_ANOMALY]
+
+# --- Detection logic (Query Builder JSON, written as YAML)
+query:
+  filter:
+    entity_type: Event
+    properties:
+      operator: AND
+      filters:
+        - name: eventCategory
+          operator: EQUAL
+          value: AUTHENTICATION
+        - name: eventResult
+          operator: EQUAL
+          value: FAILURE
+        - name: sourceCountry
+          operator: IN
+          values: [KP]
+  limit_offset_filter:
+    limit: 1000

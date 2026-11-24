@@ -1,0 +1,132 @@
+name: Drift sync (tenant -> Git)
+
+# Brings custom Threat Rules created or edited in a tenant's UI back into Git.
+#
+#   fetch (per tenant)  reads that tenant's custom rules with its own API key
+#                       (GitHub Environment secrets), writes a JSON snapshot.
+#   reconcile           no tenant keys. Updates rules/ from the snapshots
+#                       (scripts/pull_rules.py), checks for duplicates, and opens
+#                       or updates ONE pull request on branch drift/tenant-sync.
+#
+# Nothing is committed to main and nothing is deleted. Merging the PR runs the
+# normal deploy (Detections CI/CD), which re-syncs those rules to their tenants.
+#
+# rule_ids matching .drift-ignore are never imported.
+# Tenants come from the EXF_TENANTS repository variable (default "prod"), the
+# same list deploy-detections.yml uses.
+#
+# OFF BY DEFAULT: it only runs when started by hand (Actions > Drift sync > Run
+# workflow). Once your environments work, uncomment the two schedule lines below
+# to run it every 2 hours.
+
+on:
+  # schedule:
+  #   - cron: "17 */2 * * *"   # every 2 hours (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drift-sync
+  cancel-in-progress: false
+
+env:
+  KNOWN_TENANTS: ${{ vars.EXF_TENANTS || 'prod' }}
+
+jobs:
+  tenants:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.t.outputs.list }}
+    steps:
+      - id: t
+        run: |
+          list=$(printf '%s\n' $KNOWN_TENANTS | jq -R . | jq -sc .)
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+  fetch:
+    needs: tenants
+    name: fetch (${{ matrix.tenant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tenant: ${{ fromJSON(needs.tenants.outputs.list) }}
+    environment: ${{ matrix.tenant }}
+    env:
+      EXF_BASE_URL: ${{ vars.EXF_BASE_URL }}
+      EXF_PROJECT: ${{ vars.EXF_PROJECT || 'default' }}
+      EXF_API_TOKEN: ${{ secrets.EXF_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+
+      - name: Check tenant config
+        run: |
+          [ -n "$EXF_BASE_URL" ]  || { echo "::error::EXF_BASE_URL not set on environment '${{ matrix.tenant }}'"; exit 1; }
+          [ -n "$EXF_API_TOKEN" ] || { echo "::error::EXF_API_TOKEN not set on environment '${{ matrix.tenant }}'"; exit 1; }
+
+      - name: Snapshot custom rules
+        run: python3 scripts/pull_rules.py fetch --tenant "${{ matrix.tenant }}" --out "snapshot-${{ matrix.tenant }}.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-${{ matrix.tenant }}
+          path: snapshot-${{ matrix.tenant }}.json
+          retention-days: 7
+
+  reconcile:
+    needs: fetch
+    # Runs even if one tenant's fetch failed, so the run summary still reports
+    # the others; the PR step below is skipped in that case.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: snapshot-*
+          path: snapshots
+          merge-multiple: true
+
+      - name: Reconcile rules/ with tenants
+        id: sync
+        run: |
+          ls snapshots/*.json >/dev/null 2>&1 || { echo "::error::no tenant snapshots (all fetches failed)"; exit 1; }
+          python3 scripts/pull_rules.py reconcile snapshots/*.json \
+            --report "$RUNNER_TEMP/drift.md" --github-output
+          cat "$RUNNER_TEMP/drift.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Duplicate check
+        run: python3 scripts/check_duplicates.py rules
+
+      # With changes it opens or force-updates the single drift PR; with none, an
+      # existing drift PR's branch is cleaned up and the PR closes. Skipped when a
+      # tenant fetch failed, so a partial view never rewrites or closes the PR.
+      - name: Open / update drift pull request
+        if: needs.fetch.result == 'success'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # A PR opened with the default GITHUB_TOKEN does not trigger other
+          # workflows, so "validate" won't run on it. Add a DRIFT_PR_TOKEN repo
+          # secret (fine-grained PAT: contents + pull requests write) to fix that.
+          token: ${{ secrets.DRIFT_PR_TOKEN || github.token }}
+          branch: drift/tenant-sync
+          delete-branch: true
+          add-paths: rules/*.yaml
+          commit-message: "Drift sync: ${{ steps.sync.outputs.summary }}"
+          title: "Drift sync: rules changed in tenant UI (${{ steps.sync.outputs.summary }})"
+          body-path: ${{ runner.temp }}/drift.md
+          labels: drift

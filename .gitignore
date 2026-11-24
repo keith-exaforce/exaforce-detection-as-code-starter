@@ -1,0 +1,11 @@
+# Never commit secrets
+.env
+.env.*
+*.secret
+exf_token*
+github_token*
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
